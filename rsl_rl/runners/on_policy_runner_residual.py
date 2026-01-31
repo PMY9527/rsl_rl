@@ -59,6 +59,9 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                                                15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28],
                                               dtype=torch.long, device=device)
 
+        # For autoregressive CMG: store previous output
+        self.prev_cmg_output = None
+
     def cmg2usd(self, motion_cmg):
         pos_cmg = motion_cmg[..., :29]
         vel_cmg = motion_cmg[..., 29:]
@@ -112,33 +115,38 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         total_it = start_it + num_learning_iterations
         for it in range(start_it, total_it):
             start = time.time()
+            # Reset autoregressive state at start of each iteration
+            self.prev_cmg_output = None
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
-
-                    # Get raw joint data directly from robot
-                    robot = self.env.unwrapped.scene["robot"]
-                    joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions
-                    joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities
+                    # === CMG Autoregressive Forward Pass ===
+                    # Initialize prev_cmg_output from robot state if needed
+                    if self.prev_cmg_output is None:
+                        robot = self.env.unwrapped.scene["robot"]
+                        joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions in USD order
+                        joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities in USD order
+                        # Build motion input (USD order) and convert to CMG order
+                        motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                        self.prev_cmg_output = self.usd2cmg(motion_usd)
 
                     # Get velocity command from cmg_input obs group
                     command = obs["cmg_input"]  # [N, 3]
 
-                    # Build motion input (USD order) and convert to CMG order
-                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                    motion_cmg = self.usd2cmg(motion_usd)
-
-                    # Clamp and normalize for stability (?)
-                    motion_cmg = torch.clamp(motion_cmg,
-                                             self.motion_mean - 3 * self.motion_std,
-                                             self.motion_mean + 3 * self.motion_std)
-                    motion_norm = (motion_cmg - self.motion_mean) / self.motion_std # M_t Normalise, in CMG order
-                    cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1  # C_t Normalise
+                    # Clamp and normalize (use previous CMG output as input)
+                    motion_cmg_input = torch.clamp(self.prev_cmg_output,
+                                                   self.motion_mean - 3 * self.motion_std,
+                                                   self.motion_mean + 3 * self.motion_std)
+                    motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std  # Normalize in CMG order
+                    cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
 
                     # CMG forward pass (batched to avoid OOM)
                     cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                    qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean  # [N, 58] denormalize
-                    qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14)  # Clamp to prevent CMG explosion
+                    qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean  # [N, 58] denormalize in CMG order
+
+                    # Store current output for next iteration (autoregressive)
+                    self.prev_cmg_output = qref_cmg.clone()
+
                     # Convert from CMG/SDK order to USD order
                     qref = self.cmg2usd(qref_cmg)
                     
@@ -171,6 +179,13 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg["rnd_cfg"] else None
                     # Book keeping
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
+                    if dones.any():
+                        robot = self.env.unwrapped.scene["robot"]
+                        joint_pos_reset = robot.data.joint_pos[dones]
+                        joint_vel_reset = robot.data.joint_vel[dones]
+                        motion_usd_reset = torch.cat([joint_pos_reset, joint_vel_reset], dim=-1)
+                        motion_cmg_reset = self.usd2cmg(motion_usd_reset)
+                        self.prev_cmg_output[dones] = motion_cmg_reset
 
             stop = time.time()
             collect_time = stop - start
@@ -229,7 +244,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         """Get a callable inference policy that includes CMG forward pass.
 
         Returns a wrapper that:
-        1. Runs CMG to get reference joint positions
+        1. Runs CMG autoregressively to get reference joint positions
         2. Runs residual policy to get corrections
         3. Returns final action = qref[:29] + residual
         """
@@ -242,44 +257,67 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.command_min = self.command_min.to(device)
             self.command_max = self.command_max.to(device)
 
-        def inference_policy(obs: TensorDict, robot_data=None) -> torch.Tensor:
-            """Inference policy, CMG + Residual.
+        # Autoregressive state (persists across inference calls)
+        inference_prev_cmg_output = None
+
+        def inference_policy(obs: TensorDict, robot_data=None, reset=False) -> torch.Tensor:
+            """Inference policy with autoregressive CMG + Residual.
 
             Args:
                 obs: TensorDict with policy observations
                 robot_data: Optional tuple (joint_pos, joint_vel) for raw robot data.
                            If None, will extract from scaled observations (less accurate).
+                reset: If True, reset autoregressive state
             """
-            with torch.inference_mode():
+            nonlocal inference_prev_cmg_output
 
-                if robot_data is not None:
-                    joint_pos, joint_vel = robot_data
-                else:
-                    # extract from policy obs(env), in which q_vel scaled by 0.05
-                    policy_obs = obs["policy"]
-                    current_frame = policy_obs[..., -self.single_frame_dim:]
-                    joint_pos = current_frame[..., self.joint_pos_idx]
-                    joint_vel = 20 * current_frame[..., self.joint_vel_idx]
+            with torch.inference_mode():
+                # Reset autoregressive state if requested
+                if reset:
+                    inference_prev_cmg_output = None
+
+                # Initialize autoregressive state from current robot state if needed
+                if inference_prev_cmg_output is None:
+                    if robot_data is not None:
+                        joint_pos, joint_vel = robot_data
+                    else:
+                        # extract from policy obs(env), in which q_vel scaled by 0.05
+                        policy_obs = obs["policy"]
+                        current_frame = policy_obs[..., -self.single_frame_dim:]
+                        joint_pos = current_frame[..., self.joint_pos_idx]
+                        joint_vel = 20 * current_frame[..., self.joint_vel_idx]
+
+                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                    inference_prev_cmg_output = self.usd2cmg(motion_usd)
+
+                # Get command
                 command = obs["cmg_input"]
 
-                motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                motion_cmg = self.usd2cmg(motion_usd)
-                motion_cmg = torch.clamp(motion_cmg,
-                                           self.motion_mean - 3 * self.motion_std,
-                                           self.motion_mean + 3 * self.motion_std)
+                # Use previous CMG output as input (autoregressive)
+                motion_cmg_input = torch.clamp(inference_prev_cmg_output,
+                                               self.motion_mean - 3 * self.motion_std,
+                                               self.motion_mean + 3 * self.motion_std)
+                motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std
                 cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
-                motion_norm = (motion_cmg - self.motion_mean) / self.motion_std
+
+                # CMG forward pass
                 cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean 
-                qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14) 
-                qref = self.cmg2usd(qref_cmg) 
+                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean
+
+                # Store for next iteration (autoregressive)
+                inference_prev_cmg_output = qref_cmg.clone()
+
+                # Convert to USD order
+                qref = self.cmg2usd(qref_cmg)
                 obs["motion"] = qref
+
+                # Get residual from policy
                 residual = self.alg.policy.act_inference(obs)
                 # residual = torch.clamp(residual, -0.8, 0.8)
-                actions = qref[..., :29] + residual 
-                
-                # actions[:, 25] = 0.0  # left wrist pitch 
-                # actions[:, 26] = 0.0  # right wrist pitch 
+                actions = qref[..., :29] + residual
+
+                # actions[:, 25] = 0.0  # left wrist pitch
+                # actions[:, 26] = 0.0  # right wrist pitch
                 return actions
 
         return inference_policy
