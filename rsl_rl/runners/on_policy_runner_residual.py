@@ -49,6 +49,30 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         self.joint_vel_idx = slice(38, 67)  # 29 dim
         self.cmg_batch_size = 512  # Process CMG in chunks to avoid OOM
 
+        # USD → CMG/SDK
+        self.joints_usd_to_cmg = torch.tensor([0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10,
+                                               16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
+                                              dtype=torch.long, device=device)
+
+        # CMG/SDK → USD
+        self.joints_cmg_to_usd = torch.tensor([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11,
+                                               15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28],
+                                              dtype=torch.long, device=device)
+
+    def cmg2usd(self, motion_cmg):
+        pos_cmg = motion_cmg[..., :29]
+        vel_cmg = motion_cmg[..., 29:]
+        pos_usd = pos_cmg[:, self.joints_cmg_to_usd]
+        vel_usd = vel_cmg[:, self.joints_cmg_to_usd]
+        return torch.cat([pos_usd, vel_usd], dim=-1)
+
+    def usd2cmg(self, motion_usd):
+        pos_usd = motion_usd[..., :29]
+        vel_usd = motion_usd[..., 29:]
+        pos_cmg = pos_usd[:, self.joints_usd_to_cmg]
+        vel_cmg = vel_usd[:, self.joints_usd_to_cmg]
+        return torch.cat([pos_cmg, vel_cmg], dim=-1)
+
     def _cmg_forward_batched(self, motion_norm, cmd_norm):
         """Run CMG model in mini-batches to avoid OOM from large MoE intermediate tensors."""
         n = motion_norm.shape[0]
@@ -91,8 +115,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.cfg["num_steps_per_env"]):
-                    # === CMG Forward Pass ===
-                    # Get raw joint data directly from robot (not from scaled observations)
+
+                    # Get raw joint data directly from robot
                     robot = self.env.unwrapped.scene["robot"]
                     joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions
                     joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities
@@ -100,48 +124,36 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     # Get velocity command from cmg_input obs group
                     command = obs["cmg_input"]  # [N, 3]
 
-                    # Build motion input and normalize
-                    motion_input = torch.cat([joint_pos, joint_vel], dim=-1)  # [N, 58]
-                    # Clamp input to training data range (mean ± 3*std) to keep CMG in-distribution
-                    motion_input = torch.clamp(motion_input,
-                                               self.motion_mean - 3 * self.motion_std,
-                                               self.motion_mean + 3 * self.motion_std)
-                    motion_norm = (motion_input - self.motion_mean) / self.motion_std
-                    cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
+                    # Build motion input (USD order) and convert to CMG order
+                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                    motion_cmg = self.usd2cmg(motion_usd)
+
+                    # Clamp and normalize for stability (?)
+                    motion_cmg = torch.clamp(motion_cmg,
+                                             self.motion_mean - 3 * self.motion_std,
+                                             self.motion_mean + 3 * self.motion_std)
+                    motion_norm = (motion_cmg - self.motion_mean) / self.motion_std # M_t Normalise, in CMG order
+                    cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1  # C_t Normalise
 
                     # CMG forward pass (batched to avoid OOM)
                     cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                    qref = cmg_out_norm * self.motion_std + self.motion_mean  # [N, 58] denormalize
-                    # Clamp qref to prevent CMG explosion on out-of-distribution inputs
-                    qref = torch.clamp(qref, -3.14, 3.14)
-
-                    # Inject CMG output into obs for critic
+                    qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean  # [N, 58] denormalize
+                    qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14)  # Clamp to prevent CMG explosion
+                    # Convert from CMG/SDK order to USD order
+                    qref = self.cmg2usd(qref_cmg)
+                    
+                    # Inject CMG output into obs for critic.
                     obs["motion"] = qref
 
-                    # === Residual Policy ===
-                    # Get residual action from policy (only uses obs["policy"])
+                    # Residual action from policy 
                     residual = self.alg.act(obs)  # [N, 29]
-                    # Clip residual to prevent instability
-                    residual = torch.clamp(residual, -0.8, 0.8)
-                    # Zero out arm residuals - let CMG control arms directly
-                    # Left arm: 15-21, Right arm: 22-28
-                    residual[:, 15:29] = 0.0
+                    # Clip residual (?)
+                    # residual = torch.clamp(residual, -0.8, 0.8)
 
                     # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + residual  # Only position part of qref
-
-
-                    # Debug: print every 50 iterations
-                    if it % 50 == 0 and _ == 0:
-                        tracking_err = (joint_pos - qref[:, :29]).abs().mean()
-                        print(f"\n[DEBUG it={it}] qref: [{qref[:, :29].min():.3f}, {qref[:, :29].max():.3f}]")
-                        print(f"[DEBUG it={it}] joint_pos: [{joint_pos.min():.3f}, {joint_pos.max():.3f}]")
-                        print(f"[DEBUG it={it}] residual: [{residual.min():.3f}, {residual.max():.3f}], mean={residual.abs().mean():.3f}")
-                        print(f"[DEBUG it={it}] action: [{actions.min():.3f}, {actions.max():.3f}]")
-                        print(f"[DEBUG it={it}] tracking_err: {tracking_err:.4f}")
+                    actions = qref[..., :29] + residual  # Only position part of qref (Action order)
 
                     # Inject CMG output into env.extras for reward computation
-                    # This must be done BEFORE env.step() so rewards can access qref
                     self.env.unwrapped.extras["cmg_motion"] = qref
 
                     # Step the environment
@@ -166,21 +178,21 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
             # Compute returns
             with torch.inference_mode():
-                # Get raw joint data directly from robot (not from scaled observations)
                 robot = self.env.unwrapped.scene["robot"]
-                joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions
-                joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities
+                joint_pos = robot.data.joint_pos
+                joint_vel = robot.data.joint_vel
                 command = obs["cmg_input"]
-                motion_input = torch.cat([joint_pos, joint_vel], dim=-1) # Concat the obs from robot as CMG input
-                # Clamp input to training data range within 3*std to stablise CMG.
-                motion_input = torch.clamp(motion_input,
+                motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                motion_cmg = self.usd2cmg(motion_usd)
+                motion_cmg = torch.clamp(motion_cmg,
                                            self.motion_mean - 3 * self.motion_std,
                                            self.motion_mean + 3 * self.motion_std)
-                motion_norm = (motion_input - self.motion_mean) / self.motion_std # M_t Normalise
-                cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1 # C_t Normalise
+                motion_norm = (motion_cmg - self.motion_mean) / self.motion_std
+                cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
                 cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                qref = cmg_out_norm * self.motion_std + self.motion_mean # Denormalise using dataset stats.
-                qref = torch.clamp(qref, -3.14, 3.14)  # Prevent CMG explosion
+                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean
+                qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14)
+                qref = self.cmg2usd(qref_cmg)
                 obs["motion"] = qref
 
                 self.alg.compute_returns(obs)
@@ -231,7 +243,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.command_max = self.command_max.to(device)
 
         def inference_policy(obs: TensorDict, robot_data=None) -> torch.Tensor:
-            """Inference policy that combines CMG and residual.
+            """Inference policy, CMG + Residual.
 
             Args:
                 obs: TensorDict with policy observations
@@ -239,44 +251,35 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                            If None, will extract from scaled observations (less accurate).
             """
             with torch.inference_mode():
-                # Get joint data - prefer raw robot data if provided
+
                 if robot_data is not None:
                     joint_pos, joint_vel = robot_data
                 else:
-                    # Fallback: extract from policy obs (note: joint_vel may be scaled)
+                    # extract from policy obs(env), in which q_vel scaled by 0.05
                     policy_obs = obs["policy"]
                     current_frame = policy_obs[..., -self.single_frame_dim:]
                     joint_pos = current_frame[..., self.joint_pos_idx]
-                    joint_vel = current_frame[..., self.joint_vel_idx]
+                    joint_vel = 20 * current_frame[..., self.joint_vel_idx]
                 command = obs["cmg_input"]
 
-                # Normalize and run CMG
-                motion_input = torch.cat([joint_pos, joint_vel], dim=-1)
-                # Clamp input to training data range
-                motion_input = torch.clamp(motion_input,
+                motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                motion_cmg = self.usd2cmg(motion_usd)
+                motion_cmg = torch.clamp(motion_cmg,
                                            self.motion_mean - 3 * self.motion_std,
                                            self.motion_mean + 3 * self.motion_std)
-                motion_norm = (motion_input - self.motion_mean) / self.motion_std
                 cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
+                motion_norm = (motion_cmg - self.motion_mean) / self.motion_std
                 cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                qref = cmg_out_norm * self.motion_std + self.motion_mean
-                qref = torch.clamp(qref, -3.14, 3.14)  # Prevent CMG explosion
-
-                # Inject motion for critic (not used in inference but keeps consistency)
+                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean 
+                qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14) 
+                qref = self.cmg2usd(qref_cmg) 
                 obs["motion"] = qref
-
-                # Get residual from policy
                 residual = self.alg.policy.act_inference(obs)
-                # Clip residual to prevent instability
-                residual = torch.clamp(residual, -0.8, 0.8)
-                # Zero out arm residuals - let CMG control arms directly
-                # Left arm: 15-21, Right arm: 22-28
-                residual[:, 15:29] = 0.0
-
-                # Final action = reference positions + residual
-                actions = qref[..., :29] + residual
-                actions[:, 19:22] = 0.0
-                actions[:, 26:29] = 0.0 # zero out wrist actions
+                # residual = torch.clamp(residual, -0.8, 0.8)
+                actions = qref[..., :29] + residual 
+                
+                # actions[:, 25] = 0.0  # left wrist pitch 
+                # actions[:, 26] = 0.0  # right wrist pitch 
                 return actions
 
         return inference_policy
