@@ -275,8 +275,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
                 # Final action = reference positions + residual
                 actions = qref[..., :29] + residual
-                # actions[:, 19:21] = 0.0
-                # actions[:, 26:28] = 0.0 # zero out wrist actions
+                actions[:, 19:22] = 0.0
+                actions[:, 26:29] = 0.0 # zero out wrist actions
                 return actions
 
         return inference_policy
