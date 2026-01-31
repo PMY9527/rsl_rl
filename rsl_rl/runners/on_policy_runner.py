@@ -40,6 +40,10 @@ class OnPolicyRunner:
 
         # Query observations from environment for algorithm construction
         obs = self.env.get_observations()
+        # Handle tuple return from IsaacLab wrapper: (policy_tensor, {"observations": obs_dict})
+        if isinstance(obs, tuple):
+            obs_tensor, obs_extras = obs
+            obs = TensorDict(obs_extras.get("observations", {"policy": obs_tensor}), batch_size=[self.env.num_envs])
         self.cfg["obs_groups"] = resolve_obs_groups(obs, self.cfg["obs_groups"], self._get_default_obs_sets())
 
         # Create the algorithm
@@ -67,7 +71,12 @@ class OnPolicyRunner:
             )
 
         # Start learning
-        obs = self.env.get_observations().to(self.device)
+        obs = self.env.get_observations()
+        # Handle tuple return from IsaacLab wrapper: (policy_tensor, {"observations": obs_dict})
+        if isinstance(obs, tuple):
+            obs_tensor, obs_extras = obs
+            obs = TensorDict(obs_extras.get("observations", {"policy": obs_tensor}), batch_size=[self.env.num_envs])
+        obs = obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
         # Ensure all parameters are in-synced
@@ -86,7 +95,12 @@ class OnPolicyRunner:
                     # Sample actions
                     actions = self.alg.act(obs)
                     # Step the environment
-                    obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    obs_tensor, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Reconstruct TensorDict from extras (IsaacLab wrapper puts full obs_dict in extras["observations"])
+                    if "observations" in extras:
+                        obs = TensorDict(extras["observations"], batch_size=[self.env.num_envs])
+                    else:
+                        obs = TensorDict({"policy": obs_tensor}, batch_size=[self.env.num_envs])
                     # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
                     # Process the step
