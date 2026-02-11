@@ -117,9 +117,16 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             start = time.time()
             # Reset autoregressive state at start of each iteration
             self.prev_cmg_output = None
+            # CMG debug accumulators
+            _dbg_track_err = []       # per-step mean ||q_robot - q_ref||^2
+            _dbg_track_err_gated = [] # same, only high-speed envs
+            _dbg_cmg_weight = []      # per-step mean gating weight
+            _dbg_residual_abs = []    # per-step mean |residual|
+            _dbg_cmd_vx = []          # per-step mean cmd vx
+            _dbg_qref_abs = []        # per-step mean |qref_pos|
             # Rollout
             with torch.inference_mode():
-                for _ in range(self.cfg["num_steps_per_env"]):
+                for _step in range(self.cfg["num_steps_per_env"]):
                     # === CMG Autoregressive Forward Pass ===
                     # Initialize prev_cmg_output from robot state if needed
                     if self.prev_cmg_output is None:
@@ -153,10 +160,25 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     # Inject CMG output into obs for critic.
                     obs["motion"] = qref
 
-                    # Residual action from policy 
+                    # Residual action from policy
                     residual = self.alg.act(obs)  # [N, 29]
                     # Clip residual (?)
                     # residual = torch.clamp(residual, -0.8, 0.8)
+
+                    # --- CMG Debug: collect per-step diagnostics ---
+                    with torch.no_grad():
+                        _robot_pos = self.env.unwrapped.scene["robot"].data.joint_pos  # [N, 29]
+                        _cmd_vx = command[:, 0]
+                        _cmg_w = torch.clamp((_cmd_vx - 1.1) / 0.2, 0.0, 1.0)
+                        _err_sq = ((_robot_pos - qref[:, :29]) ** 2).sum(dim=1)  # [N]
+                        _dbg_track_err.append(_err_sq.mean().item())
+                        _high = _cmg_w > 0
+                        if _high.any():
+                            _dbg_track_err_gated.append(_err_sq[_high].mean().item())
+                        _dbg_cmg_weight.append(_cmg_w.mean().item())
+                        _dbg_residual_abs.append(residual.abs().mean().item())
+                        _dbg_cmd_vx.append(_cmd_vx.mean().item())
+                        _dbg_qref_abs.append(qref[:, :29].abs().mean().item())
 
                     # Final action = reference joint positions + residual
                     actions = qref[..., :29] + residual  # Only position part of qref (Action order)
@@ -186,6 +208,22 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                         motion_usd_reset = torch.cat([joint_pos_reset, joint_vel_reset], dim=-1)
                         motion_cmg_reset = self.usd2cmg(motion_usd_reset)
                         self.prev_cmg_output[dones] = motion_cmg_reset
+
+            # --- CMG Debug: log to tensorboard ---
+            if hasattr(self.logger, 'writer') and self.logger.writer is not None:
+                _w = self.logger.writer
+                n_steps = len(_dbg_track_err)
+                _w.add_scalar("CMG_Debug/tracking_error_pos", sum(_dbg_track_err) / n_steps, it)
+                if _dbg_track_err_gated:
+                    _w.add_scalar("CMG_Debug/tracking_error_gated", sum(_dbg_track_err_gated) / len(_dbg_track_err_gated), it)
+                _w.add_scalar("CMG_Debug/cmg_weight_mean", sum(_dbg_cmg_weight) / n_steps, it)
+                _w.add_scalar("CMG_Debug/residual_mean_abs", sum(_dbg_residual_abs) / n_steps, it)
+                _w.add_scalar("CMG_Debug/cmd_vx_mean", sum(_dbg_cmd_vx) / n_steps, it)
+                _w.add_scalar("CMG_Debug/qref_pos_mean_abs", sum(_dbg_qref_abs) / n_steps, it)
+                # Error at start, middle, end of rollout — shows if error grows over AR steps
+                _w.add_scalar("CMG_Debug/error_step_first", _dbg_track_err[0], it)
+                _w.add_scalar("CMG_Debug/error_step_mid", _dbg_track_err[n_steps // 2], it)
+                _w.add_scalar("CMG_Debug/error_step_last", _dbg_track_err[-1], it)
 
             stop = time.time()
             collect_time = stop - start
