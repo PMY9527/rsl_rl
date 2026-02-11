@@ -11,13 +11,13 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
 sys.path.insert(0, _PROJECT_ROOT)
 
 from rsl_rl.runners import OnPolicyRunner
-from cmg_ws.module.cmg import CMG
+from cmg_workspace.module.cmg import CMG
 
 class OnPolicyRunnerResidual(OnPolicyRunner):
     def __init__(self, env, train_cfg, log_dir = None, device = "cuda"):
         super().__init__(env, train_cfg, log_dir, device)
-        cmg_policy_path = os.path.join(_PROJECT_ROOT, "cmg_ws/runs/cmg_20260123_194851/cmg_final.pt")
-        data_path = os.path.join(_PROJECT_ROOT, "cmg_ws/dataloader/cmg_training_data.pt")
+        cmg_policy_path = os.path.join(_PROJECT_ROOT, "cmg_workspace/runs/cmg_20260211_040530/cmg_ckpt_800.pt")
+        data_path = os.path.join(_PROJECT_ROOT, "cmg_workspace/dataloader/cmg_training_data.pt")
         self.data = torch.load(data_path, weights_only=False)
 
         stats = self.data["stats"]
