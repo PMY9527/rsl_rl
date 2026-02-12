@@ -127,21 +127,24 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for _step in range(self.cfg["num_steps_per_env"]):
-                    # === CMG Autoregressive Forward Pass ===
-                    # Initialize prev_cmg_output from robot state if needed
-                    if self.prev_cmg_output is None:
-                        robot = self.env.unwrapped.scene["robot"]
-                        joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions in USD order
-                        joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities in USD order
-                        # Build motion input (USD order) and convert to CMG order
-                        motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                        self.prev_cmg_output = self.usd2cmg(motion_usd)
+                    # === Hybrid AR/Non-AR CMG Forward Pass ===
+                    # Always read fresh robot state
+                    robot = self.env.unwrapped.scene["robot"]
+                    fresh_usd = torch.cat([robot.data.joint_pos, robot.data.joint_vel], dim=-1)
+                    fresh_cmg = self.usd2cmg(fresh_usd)
 
                     # Get velocity command from cmg_input obs group
                     command = obs["cmg_input"]  # [N, 3]
 
-                    # Clamp and normalize (use previous CMG output as input)
-                    motion_cmg_input = torch.clamp(self.prev_cmg_output,
+                    # Hybrid: at high speed use AR (CMG's own output), at low speed use fresh robot state
+                    if self.prev_cmg_output is None:
+                        cmg_input = fresh_cmg
+                    else:
+                        ar_gate = torch.clamp((command[:, 0] - 1.1) / 0.2, 0.0, 1.0).unsqueeze(-1)  # [N, 1]
+                        cmg_input = ar_gate * self.prev_cmg_output + (1.0 - ar_gate) * fresh_cmg
+
+                    # Clamp and normalize
+                    motion_cmg_input = torch.clamp(cmg_input,
                                                    self.motion_mean - 3 * self.motion_std,
                                                    self.motion_mean + 3 * self.motion_std)
                     motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std  # Normalize in CMG order
@@ -314,25 +317,29 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 if reset:
                     inference_prev_cmg_output = None
 
-                # Initialize autoregressive state from current robot state if needed
-                if inference_prev_cmg_output is None:
-                    if robot_data is not None:
-                        joint_pos, joint_vel = robot_data
-                    else:
-                        # extract from policy obs(env), in which q_vel scaled by 0.05
-                        policy_obs = obs["policy"]
-                        current_frame = policy_obs[..., -self.single_frame_dim:]
-                        joint_pos = current_frame[..., self.joint_pos_idx]
-                        joint_vel = 20 * current_frame[..., self.joint_vel_idx]
+                # Get fresh robot state
+                if robot_data is not None:
+                    joint_pos, joint_vel = robot_data
+                else:
+                    policy_obs = obs["policy"]
+                    current_frame = policy_obs[..., -self.single_frame_dim:]
+                    joint_pos = current_frame[..., self.joint_pos_idx]
+                    joint_vel = 20 * current_frame[..., self.joint_vel_idx]
 
-                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                    inference_prev_cmg_output = self.usd2cmg(motion_usd)
+                fresh_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                fresh_cmg = self.usd2cmg(fresh_usd)
 
                 # Get command
                 command = obs["cmg_input"]
 
-                # Use previous CMG output as input (autoregressive)
-                motion_cmg_input = torch.clamp(inference_prev_cmg_output,
+                # Hybrid: at high speed use AR, at low speed use fresh robot state
+                if inference_prev_cmg_output is None:
+                    cmg_input = fresh_cmg
+                else:
+                    ar_gate = torch.clamp((command[:, 0] - 1.1) / 0.2, 0.0, 1.0).unsqueeze(-1)
+                    cmg_input = ar_gate * inference_prev_cmg_output + (1.0 - ar_gate) * fresh_cmg
+
+                motion_cmg_input = torch.clamp(cmg_input,
                                                self.motion_mean - 3 * self.motion_std,
                                                self.motion_mean + 3 * self.motion_std)
                 motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std
