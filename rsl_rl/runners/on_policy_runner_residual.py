@@ -186,6 +186,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     # Final action = reference joint positions + residual
                     actions = qref[..., :29] + residual  # Only position part of qref (Action order)
 
+                    actions[:, 25] = 0.0  # left wrist pitch
+                    actions[:, 26] = 0.0  # right wrist pitch
                     # Inject CMG output into env.extras for reward computation
                     self.env.unwrapped.extras["cmg_motion"] = qref
 
@@ -361,8 +363,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 # residual = torch.clamp(residual, -0.8, 0.8)
                 actions = qref[..., :29] + residual
 
-                # actions[:, 25] = 0.0  # left wrist pitch
-                # actions[:, 26] = 0.0  # right wrist pitch
+                actions[:, 25] = 0.0  # left wrist pitch
+                actions[:, 26] = 0.0  # right wrist pitch
                 return actions
 
         return inference_policy
