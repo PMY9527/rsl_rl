@@ -50,13 +50,13 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         self.cmg_batch_size = 512  # Process CMG in chunks to avoid OOM
 
         # USD → CMG/SDK
-        self.joints_usd_to_cmg = torch.tensor([0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10,
-                                               16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
+        self.joints_usd_to_cmg = torch.tensor([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11,
+                                               15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28],
                                               dtype=torch.long, device=device)
 
         # CMG/SDK → USD
-        self.joints_cmg_to_usd = torch.tensor([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11,
-                                               15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28],
+        self.joints_cmg_to_usd = torch.tensor([0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10,
+                                               16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
                                               dtype=torch.long, device=device)
 
     def cmg2usd(self, motion_cmg):
@@ -147,11 +147,12 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
                     # Residual action from policy 
                     residual = self.alg.act(obs)  # [N, 29]
-                    # Clip residual (?)
-                    # residual = torch.clamp(residual, -0.8, 0.8)
 
                     # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + residual  # Only position part of qref (Action order)
+                    actions = qref[..., :29] + 0.25 * residual  # Only position part of qref (Action order)
+                    
+                    actions[:, 25] = 0.0  # left wrist pitch
+                    actions[:, 26] = 0.0  # right wrist pitch
 
                     # Inject CMG output into env.extras for reward computation
                     self.env.unwrapped.extras["cmg_motion"] = qref
@@ -276,10 +277,10 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 obs["motion"] = qref
                 residual = self.alg.policy.act_inference(obs)
                 # residual = torch.clamp(residual, -0.8, 0.8)
-                actions = qref[..., :29] + residual 
+                actions = qref[..., :29] + 0.25 * residual 
                 
-                # actions[:, 25] = 0.0  # left wrist pitch 
-                # actions[:, 26] = 0.0  # right wrist pitch 
+                actions[:, 25] = 0.0  # left wrist pitch 
+                actions[:, 26] = 0.0  # right wrist pitch 
                 return actions
 
         return inference_policy
