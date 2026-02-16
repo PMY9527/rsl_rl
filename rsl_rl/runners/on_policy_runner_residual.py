@@ -49,15 +49,30 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         self.joint_vel_idx = slice(38, 67)  # 29 dim
         self.cmg_batch_size = 512  # Process CMG in chunks to avoid OOM
 
-        # USD → CMG/SDK
-        self.joints_usd_to_cmg = torch.tensor([0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10,
-                                               16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
-                                              dtype=torch.long, device=device)
-
-        # CMG/SDK → USD
-        self.joints_cmg_to_usd = torch.tensor([0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11,
-                                               15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28],
-                                              dtype=torch.long, device=device)
+        # Build USD↔SDK permutation dynamically from actual joint names
+        sdk_joint_names = [
+            "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+            "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+            "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+            "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+            "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+            "left_shoulder_pitch_joint", "left_shoulder_roll_joint", "left_shoulder_yaw_joint",
+            "left_elbow_joint", "left_wrist_roll_joint", "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+            "right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
+            "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+        ]
+        usd_joint_names = self.env.unwrapped.scene["robot"].data.joint_names
+        # usd_to_cmg[sdk_i] = usd_idx where sdk joint i lives
+        usd_name_to_idx = {name: idx for idx, name in enumerate(usd_joint_names)}
+        usd_to_cmg = [usd_name_to_idx[name] for name in sdk_joint_names]
+        self.joints_usd_to_cmg = torch.tensor(usd_to_cmg, dtype=torch.long, device=device)
+        # cmg_to_usd = inverse permutation
+        cmg_to_usd = [0] * 29
+        for sdk_i, usd_i in enumerate(usd_to_cmg):
+            cmg_to_usd[usd_i] = sdk_i
+        self.joints_cmg_to_usd = torch.tensor(cmg_to_usd, dtype=torch.long, device=device)
+        print(f"[CMG] USD→SDK permutation: {usd_to_cmg}")
+        print(f"[CMG] SDK→USD permutation: {cmg_to_usd}")
 
         # For autoregressive CMG: store previous output
         self.prev_cmg_output = None
@@ -127,27 +142,20 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             # Rollout
             with torch.inference_mode():
                 for _step in range(self.cfg["num_steps_per_env"]):
-                    # === Hybrid AR/Non-AR CMG Forward Pass ===
-                    # Always read fresh robot state
-                    robot = self.env.unwrapped.scene["robot"]
-                    fresh_usd = torch.cat([robot.data.joint_pos, robot.data.joint_vel], dim=-1)
-                    fresh_cmg = self.usd2cmg(fresh_usd)
+                    # === Pure Autoregressive CMG Forward Pass ===
+                    if self.prev_cmg_output is None:
+                        robot = self.env.unwrapped.scene["robot"]
+                        motion_usd = torch.cat([robot.data.joint_pos, robot.data.joint_vel], dim=-1)
+                        self.prev_cmg_output = self.usd2cmg(motion_usd)
 
                     # Get velocity command from cmg_input obs group
                     command = obs["cmg_input"]  # [N, 3]
 
-                    # Hybrid: at high speed use AR (CMG's own output), at low speed use fresh robot state
-                    if self.prev_cmg_output is None:
-                        cmg_input = fresh_cmg
-                    else:
-                        ar_gate = torch.clamp((command[:, 0] - 1.1) / 0.2, 0.0, 1.0).unsqueeze(-1)  # [N, 1]
-                        cmg_input = ar_gate * self.prev_cmg_output + (1.0 - ar_gate) * fresh_cmg
-
-                    # Clamp and normalize
-                    motion_cmg_input = torch.clamp(cmg_input,
+                    # Normalize previous CMG output as input
+                    motion_cmg_input = torch.clamp(self.prev_cmg_output,
                                                    self.motion_mean - 3 * self.motion_std,
                                                    self.motion_mean + 3 * self.motion_std)
-                    motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std  # Normalize in CMG order
+                    motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std
                     cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
 
                     # CMG forward pass (batched to avoid OOM)
@@ -165,8 +173,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
                     # Residual action from policy
                     residual = self.alg.act(obs)  # [N, 29]
-                    # Clip residual (?)
-                    # residual = torch.clamp(residual, -0.8, 0.8)
+                    # residual = torch.clamp(residual, -0.3, 0.3)
 
                     # --- CMG Debug: collect per-step diagnostics ---
                     with torch.no_grad():
@@ -183,8 +190,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                         _dbg_cmd_vx.append(_cmd_vx.mean().item())
                         _dbg_qref_abs.append(qref[:, :29].abs().mean().item())
 
-                    # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + residual  # Only position part of qref (Action order)
+                    # Final action = reference joint positions + scaled residual
+                    actions = qref[..., :29] + 0.25 * residual  # Only position part of qref (Action order)
 
                     actions[:, 25] = 0.0  # left wrist pitch
                     actions[:, 26] = 0.0  # right wrist pitch
@@ -303,6 +310,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         # Autoregressive state (persists across inference calls)
         inference_prev_cmg_output = None
 
+        _inf_step = [0]  # mutable counter for debug
+
         def inference_policy(obs: TensorDict, robot_data=None, reset=False) -> torch.Tensor:
             """Inference policy with autoregressive CMG + Residual.
 
@@ -319,29 +328,33 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 if reset:
                     inference_prev_cmg_output = None
 
-                # Get fresh robot state
-                if robot_data is not None:
-                    joint_pos, joint_vel = robot_data
-                else:
-                    policy_obs = obs["policy"]
-                    current_frame = policy_obs[..., -self.single_frame_dim:]
-                    joint_pos = current_frame[..., self.joint_pos_idx]
-                    joint_vel = 20 * current_frame[..., self.joint_vel_idx]
+                # Initialize from robot state if needed
+                if inference_prev_cmg_output is None:
+                    if robot_data is not None:
+                        joint_pos, joint_vel = robot_data
+                    else:
+                        # Read absolute joint positions directly from robot (not from observations)
+                        robot = self.env.unwrapped.scene["robot"]
+                        joint_pos = robot.data.joint_pos
+                        joint_vel = robot.data.joint_vel
 
-                fresh_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                fresh_cmg = self.usd2cmg(fresh_usd)
+                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
+                    inference_prev_cmg_output = self.usd2cmg(motion_usd)
+                    if os.environ.get("CMG_DEBUG", "0") == "1":
+                        import numpy as np
+                        np.set_printoptions(precision=4, suppress=True)
+                        _robot = self.env.unwrapped.scene["robot"]
+                        _jnames = _robot.data.joint_names
+                        print(f"\n=== CMG INIT STATE ===")
+                        print(f"  USD joint names and values:")
+                        for _ji, (_jn, _jv) in enumerate(zip(_jnames, joint_pos[0].cpu().numpy())):
+                            print(f"    USD[{_ji:2d}] {_jn:30s}: {_jv:+.4f}")
 
                 # Get command
                 command = obs["cmg_input"]
 
-                # Hybrid: at high speed use AR, at low speed use fresh robot state
-                if inference_prev_cmg_output is None:
-                    cmg_input = fresh_cmg
-                else:
-                    ar_gate = torch.clamp((command[:, 0] - 1.1) / 0.2, 0.0, 1.0).unsqueeze(-1)
-                    cmg_input = ar_gate * inference_prev_cmg_output + (1.0 - ar_gate) * fresh_cmg
-
-                motion_cmg_input = torch.clamp(cmg_input,
+                # Normalize previous CMG output as input
+                motion_cmg_input = torch.clamp(inference_prev_cmg_output,
                                                self.motion_mean - 3 * self.motion_std,
                                                self.motion_mean + 3 * self.motion_std)
                 motion_norm = (motion_cmg_input - self.motion_mean) / self.motion_std
@@ -358,10 +371,31 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 qref = self.cmg2usd(qref_cmg)
                 obs["motion"] = qref
 
+                # Debug: print first few steps
+                if os.environ.get("CMG_DEBUG", "0") == "1" and _inf_step[0] < 5:
+                    _sdk_names = [
+                        'L_hip_pitch','L_hip_roll','L_hip_yaw','L_knee','L_ankle_pitch','L_ankle_roll',
+                        'R_hip_pitch','R_hip_roll','R_hip_yaw','R_knee','R_ankle_pitch','R_ankle_roll',
+                        'waist_yaw','waist_roll','waist_pitch',
+                        'L_shoulder_pitch','L_shoulder_roll','L_shoulder_yaw','L_elbow',
+                        'L_wrist_roll','L_wrist_pitch','L_wrist_yaw',
+                        'R_shoulder_pitch','R_shoulder_roll','R_shoulder_yaw','R_elbow',
+                        'R_wrist_roll','R_wrist_pitch','R_wrist_yaw',
+                    ]
+                    print(f"\n=== CMG Debug Step {_inf_step[0]} — all 29 joints (SDK order) ===")
+                    _pos_sdk = qref_cmg[0, :29].cpu().numpy()
+                    for _i, (_n, _v) in enumerate(zip(_sdk_names, _pos_sdk)):
+                        print(f"  [{_i:2d}] {_n:20s}: {_v:+.4f}")
+                    print(f"  cmd norm: {cmd_norm[0, :3].cpu().numpy()}")
+
+                _inf_step[0] += 1
+
                 # Get residual from policy
-                residual = self.alg.policy.act_inference(obs)
-                # residual = torch.clamp(residual, -0.8, 0.8)
-                actions = qref[..., :29] + residual
+                if os.environ.get("CMG_DEBUG", "0") == "1":
+                    actions = qref[..., :29]  # Pure CMG, no residual
+                else:
+                    residual = self.alg.policy.act_inference(obs)
+                    actions = qref[..., :29] + 0.25 * residual
 
                 actions[:, 25] = 0.0  # left wrist pitch
                 actions[:, 26] = 0.0  # right wrist pitch
