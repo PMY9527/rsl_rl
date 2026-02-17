@@ -149,7 +149,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     residual = self.alg.act(obs)  # [N, 29]
 
                     # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + 0.25 * residual  # Only position part of qref (Action order)
+                    actions = qref[..., :29] + residual  # Only position part of qref (Action order)
                     
                     actions[:, 25] = 0.0  # left wrist pitch
                     actions[:, 26] = 0.0  # right wrist pitch
@@ -256,7 +256,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 if robot_data is not None:
                     joint_pos, joint_vel = robot_data
                 else:
-                    # extract from policy obs(env), in which q_vel scaled by 0.05
+                    # extract from policy obs(env), in which q_vel scaled by 0.05, cmg takes raw q_pos q_vel
                     policy_obs = obs["policy"]
                     current_frame = policy_obs[..., -self.single_frame_dim:]
                     joint_pos = current_frame[..., self.joint_pos_idx]
@@ -276,8 +276,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 qref = self.cmg2usd(qref_cmg) 
                 obs["motion"] = qref
                 residual = self.alg.policy.act_inference(obs)
-                # residual = torch.clamp(residual, -0.8, 0.8)
-                actions = qref[..., :29] + 0.25 * residual 
+                actions = qref[..., :29] + residual 
                 
                 actions[:, 25] = 0.0  # left wrist pitch 
                 actions[:, 26] = 0.0  # right wrist pitch 
