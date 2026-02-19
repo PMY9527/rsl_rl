@@ -59,6 +59,10 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                                                16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
                                               dtype=torch.long, device=device)
 
+        # AR 
+        self.prev_output_cmg = torch.zeros(env.num_envs, 58, device=device)
+        self.ar_initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+
     def cmg2usd(self, motion_cmg):
         pos_cmg = motion_cmg[..., :29]
         vel_cmg = motion_cmg[..., 29:]
@@ -85,6 +89,32 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             out = self.model(motion_norm[i:end], cmd_norm[i:end])
             outputs.append(out)
         return torch.cat(outputs, dim=0)
+
+    def _cmg_step_ar(self, joint_pos, joint_vel, command):
+        """One autoregressive CMG step. Returns qref [N, 58] in USD order."""
+        motion_cmg = self.usd2cmg(torch.cat([joint_pos, joint_vel], dim=-1))
+        ar_mask = self.ar_initialized.unsqueeze(-1)
+        input_cmg = torch.where(ar_mask, self.prev_output_cmg, motion_cmg)
+
+        input_cmg = torch.clamp(input_cmg,
+                                self.motion_mean - 3 * self.motion_std,
+                                self.motion_mean + 3 * self.motion_std)
+        motion_norm = (input_cmg - self.motion_mean) / self.motion_std
+        cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
+
+        cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
+        output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
+        output_cmg = torch.clamp(output_cmg, -3.14, 3.14)
+
+        self.prev_output_cmg = output_cmg.clone()
+        self.ar_initialized[:] = True
+
+        return self.cmg2usd(output_cmg)
+
+    def _cmg_reset_ar(self, done_mask):
+        """Reset AR state for environments that terminated."""
+        if done_mask.any():
+            self.ar_initialized[done_mask] = False
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
         # Randomize initial episode lengths (for exploration)
@@ -120,37 +150,19 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     robot = self.env.unwrapped.scene["robot"]
                     joint_pos = robot.data.joint_pos  # [N, 29] - absolute positions
                     joint_vel = robot.data.joint_vel  # [N, 29] - unscaled velocities
-
-                    # Get velocity command from cmg_input obs group
                     command = obs["cmg_input"]  # [N, 3]
 
-                    # Build motion input (USD order) and convert to CMG order
-                    motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                    motion_cmg = self.usd2cmg(motion_usd)
+                    # CMG autoregressive forward
+                    qref = self._cmg_step_ar(joint_pos, joint_vel, command)
 
-                    # Clamp and normalize for stability (?)
-                    motion_cmg = torch.clamp(motion_cmg,
-                                             self.motion_mean - 3 * self.motion_std,
-                                             self.motion_mean + 3 * self.motion_std)
-                    motion_norm = (motion_cmg - self.motion_mean) / self.motion_std # M_t Normalise, in CMG order
-                    cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1  # C_t Normalise
-
-                    # CMG forward pass (batched to avoid OOM)
-                    cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                    qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean  # [N, 58] denormalize
-                    qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14)  # Clamp to prevent CMG explosion
-                    # Convert from CMG/SDK order to USD order
-                    qref = self.cmg2usd(qref_cmg)
-                    
-                    # Inject CMG output into obs for critic.
+                    # Inject CMG output into obs for critic
                     obs["motion"] = qref
 
-                    # Residual action from policy 
+                    # Residual action from policy
                     residual = self.alg.act(obs)  # [N, 29]
 
                     # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + residual  # Only position part of qref (Action order)
-                    
+                    actions = qref[..., :29] + residual
                     actions[:, 25] = 0.0  # left wrist pitch
                     actions[:, 26] = 0.0  # right wrist pitch
 
@@ -159,18 +171,17 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
                     # Step the environment
                     obs_tensor, rewards, dones, extras = self.env.step(actions.to(self.env.device))
-                    # Reconstruct TensorDict from extras (IsaacLab wrapper puts full obs_dict in extras["observations"])
                     if "observations" in extras:
                         obs = TensorDict(extras["observations"], batch_size=[self.env.num_envs])
                     else:
                         obs = TensorDict({"policy": obs_tensor}, batch_size=[self.env.num_envs])
-                    # Move to device
                     obs, rewards, dones = (obs.to(self.device), rewards.to(self.device), dones.to(self.device))
-                    # Process the step
                     self.alg.process_env_step(obs, rewards, dones, extras)
-                    # Extract intrinsic rewards (only for logging)
+
+                    # Reset AR state for done envs
+                    self._cmg_reset_ar(dones.bool())
+
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg["rnd_cfg"] else None
-                    # Book keeping
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
 
             stop = time.time()
@@ -183,17 +194,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 joint_pos = robot.data.joint_pos
                 joint_vel = robot.data.joint_vel
                 command = obs["cmg_input"]
-                motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                motion_cmg = self.usd2cmg(motion_usd)
-                motion_cmg = torch.clamp(motion_cmg,
-                                           self.motion_mean - 3 * self.motion_std,
-                                           self.motion_mean + 3 * self.motion_std)
-                motion_norm = (motion_cmg - self.motion_mean) / self.motion_std
-                cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
-                cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean
-                qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14)
-                qref = self.cmg2usd(qref_cmg)
+                qref = self._cmg_step_ar(joint_pos, joint_vel, command)
                 obs["motion"] = qref
 
                 self.alg.compute_returns(obs)
@@ -227,12 +228,14 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))
 
     def get_inference_policy(self, device: str | None = None) -> callable:
-        """Get a callable inference policy that includes CMG forward pass.
+        """Get a callable inference policy with autoregressive CMG.
 
         Returns a wrapper that:
-        1. Runs CMG to get reference joint positions
+        1. Runs AR CMG to get reference joint positions
         2. Runs residual policy to get corrections
         3. Returns final action = qref[:29] + residual
+
+        The returned function accepts an optional `dones` kwarg to reset AR state.
         """
         self.eval_mode()
         if device is not None:
@@ -243,43 +246,58 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.command_min = self.command_min.to(device)
             self.command_max = self.command_max.to(device)
 
-        def inference_policy(obs: TensorDict, robot_data=None) -> torch.Tensor:
-            """Inference policy, CMG + Residual.
+        # AR state for inference (separate from training buffers)
+        ar_state = {"prev": None, "init": None}
 
-            Args:
-                obs: TensorDict with policy observations
-                robot_data: Optional tuple (joint_pos, joint_vel) for raw robot data.
-                           If None, will extract from scaled observations (less accurate).
-            """
+        def inference_policy(obs: TensorDict, robot_data=None, dones=None) -> torch.Tensor:
             with torch.inference_mode():
-
                 if robot_data is not None:
                     joint_pos, joint_vel = robot_data
                 else:
-                    # extract from policy obs(env), in which q_vel scaled by 0.05, cmg takes raw q_pos q_vel
                     policy_obs = obs["policy"]
                     current_frame = policy_obs[..., -self.single_frame_dim:]
                     joint_pos = current_frame[..., self.joint_pos_idx]
                     joint_vel = 20 * current_frame[..., self.joint_vel_idx]
                 command = obs["cmg_input"]
 
-                motion_usd = torch.cat([joint_pos, joint_vel], dim=-1)
-                motion_cmg = self.usd2cmg(motion_usd)
-                motion_cmg = torch.clamp(motion_cmg,
-                                           self.motion_mean - 3 * self.motion_std,
-                                           self.motion_mean + 3 * self.motion_std)
+                n = joint_pos.shape[0]
+                dev = joint_pos.device
+
+                # Lazy init AR state
+                if ar_state["prev"] is None or ar_state["prev"].shape[0] != n:
+                    ar_state["prev"] = torch.zeros(n, 58, device=dev)
+                    ar_state["init"] = torch.zeros(n, dtype=torch.bool, device=dev)
+
+                # Reset AR for done envs
+                if dones is not None:
+                    done_mask = dones.bool()
+                    if done_mask.any():
+                        ar_state["init"][done_mask] = False
+
+                # AR CMG forward
+                motion_cmg = self.usd2cmg(torch.cat([joint_pos, joint_vel], dim=-1))
+                ar_mask = ar_state["init"].unsqueeze(-1)
+                input_cmg = torch.where(ar_mask, ar_state["prev"], motion_cmg)
+
+                input_cmg = torch.clamp(input_cmg,
+                                        self.motion_mean - 3 * self.motion_std,
+                                        self.motion_mean + 3 * self.motion_std)
+                motion_norm = (input_cmg - self.motion_mean) / self.motion_std
                 cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
-                motion_norm = (motion_cmg - self.motion_mean) / self.motion_std
+
                 cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
-                qref_cmg = cmg_out_norm * self.motion_std + self.motion_mean 
-                qref_cmg = torch.clamp(qref_cmg, -3.14, 3.14) 
-                qref = self.cmg2usd(qref_cmg) 
+                output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
+                output_cmg = torch.clamp(output_cmg, -3.14, 3.14)
+
+                ar_state["prev"] = output_cmg.clone()
+                ar_state["init"][:] = True
+
+                qref = self.cmg2usd(output_cmg)
                 obs["motion"] = qref
                 residual = self.alg.policy.act_inference(obs)
-                actions = qref[..., :29] + residual 
-                
-                actions[:, 25] = 0.0  # left wrist pitch 
-                actions[:, 26] = 0.0  # right wrist pitch 
+                actions = qref[..., :29] + residual
+                actions[:, 25] = 0.0
+                actions[:, 26] = 0.0
                 return actions
 
         return inference_policy
