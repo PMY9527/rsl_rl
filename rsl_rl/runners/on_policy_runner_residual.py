@@ -16,7 +16,7 @@ from cmg_workspace.module.cmg import CMG
 class OnPolicyRunnerResidual(OnPolicyRunner):
     def __init__(self, env, train_cfg, log_dir = None, device = "cuda"):
         super().__init__(env, train_cfg, log_dir, device)
-        cmg_policy_path = os.path.join(_PROJECT_ROOT, "cmg_workspace/runs/cmg_20260211_040530/cmg_ckpt_800.pt")
+        cmg_policy_path = os.path.join(_PROJECT_ROOT, "cmg_workspace/runs/cmg_20260316_162827/cmg_ckpt_350.pt")
         data_path = os.path.join(_PROJECT_ROOT, "cmg_workspace/dataloader/cmg_training_data.pt")
         self.data = torch.load(data_path, weights_only=False)
 
@@ -25,14 +25,14 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             motion_dim=stats["motion_dim"],
             command_dim=stats["command_dim"],
             hidden_dim=512,
-            num_experts=4,
+            num_experts=8,
             num_layers=3,
         )
 
         self.motion_mean = torch.tensor(stats["motion_mean"], device=device, dtype=torch.float32)
         self.motion_std = torch.tensor(stats["motion_std"], device=device, dtype=torch.float32)
-        self.command_min = torch.tensor(stats["command_min"], device=device, dtype=torch.float32)
-        self.command_max = torch.tensor(stats["command_max"], device=device, dtype=torch.float32)
+        self.command_mean = torch.tensor(stats["command_mean"], device=device, dtype=torch.float32)
+        self.command_std = torch.tensor(stats["command_std"], device=device, dtype=torch.float32)
 
         # Load CMG weights, freeze, and set to eval mode
         cmg_checkpoint = torch.load(cmg_policy_path, weights_only=False)
@@ -100,8 +100,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                                 self.motion_mean - 3 * self.motion_std,
                                 self.motion_mean + 3 * self.motion_std)
         motion_norm = (input_cmg - self.motion_mean) / self.motion_std
-        cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
-
+        cmd_norm = (command - self.command_mean) / self.command_std
         cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
         output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
         output_cmg = torch.clamp(output_cmg, -3.14, 3.14)
@@ -243,8 +242,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.model.to(device)
             self.motion_mean = self.motion_mean.to(device)
             self.motion_std = self.motion_std.to(device)
-            self.command_min = self.command_min.to(device)
-            self.command_max = self.command_max.to(device)
+            self.command_std = self.command_std.to(device)
+            self.command_mean = self.command_mean.to(device)
 
         # AR state for inference (separate from training buffers)
         ar_state = {"prev": None, "init": None}
@@ -283,7 +282,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                                         self.motion_mean - 3 * self.motion_std,
                                         self.motion_mean + 3 * self.motion_std)
                 motion_norm = (input_cmg - self.motion_mean) / self.motion_std
-                cmd_norm = (command - self.command_min) / (self.command_max - self.command_min) * 2 - 1
+                cmd_norm = (command - self.command_mean) / self.command_std
 
                 cmg_out_norm = self._cmg_forward_batched(motion_norm, cmd_norm)
                 output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
@@ -314,8 +313,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             "cmg_stats": {
                 "motion_mean": self.motion_mean.cpu(),
                 "motion_std": self.motion_std.cpu(),
-                "command_min": self.command_min.cpu(),
-                "command_max": self.command_max.cpu(),
+                "command_std": self.command_std.cpu(),
+                "command_mean": self.command_mean.cpu(),
                 "single_frame_dim": self.single_frame_dim,
                 "joint_pos_idx": (self.joint_pos_idx.start, self.joint_pos_idx.stop),
                 "joint_vel_idx": (self.joint_vel_idx.start, self.joint_vel_idx.stop),
