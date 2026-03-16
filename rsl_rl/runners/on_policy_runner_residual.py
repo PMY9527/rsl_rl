@@ -243,7 +243,7 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
             self.command_min = self.command_min.to(device)
             self.command_max = self.command_max.to(device)
 
-        def inference_policy(obs: TensorDict, robot_data=None) -> torch.Tensor:
+        def inference_policy(obs: TensorDict, robot_data=None, **kwargs) -> torch.Tensor:
             """Inference policy, CMG + Residual.
 
             Args:
