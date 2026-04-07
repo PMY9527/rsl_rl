@@ -9,6 +9,7 @@ import os
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, _PROJECT_ROOT)
+LEAK_PERCENT = 0.05
 
 from rsl_rl.runners import OnPolicyRunner
 from cmg_workspace.module.cmg import CMG
@@ -59,9 +60,15 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                                                16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28],
                                               dtype=torch.long, device=device)
 
-        # AR 
+        # AR
         self.prev_output_cmg = torch.zeros(env.num_envs, 58, device=device)
         self.ar_initialized = torch.zeros(env.num_envs, dtype=torch.bool, device=device)
+
+        # Reference to action term for dynamic CMG offset
+        self.action_term = self.env.unwrapped.action_manager._terms["JointPositionAction"]
+
+        # Default joint positions for standing (used to gate CMG offset at cmd≈0)
+        self.default_joint_pos = self.env.unwrapped.scene["robot"].data.default_joint_pos.clone()
 
     def cmg2usd(self, motion_cmg):
         pos_cmg = motion_cmg[..., :29]
@@ -105,10 +112,23 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
         output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
         output_cmg = torch.clamp(output_cmg, -3.14, 3.14)
 
-        self.prev_output_cmg = output_cmg.clone()
+        # Leaky AR: blend stored state with actual robot state to prevent
+        # AR drift (matches deploy C++ pattern: post-blend on stored state)
+        self.prev_output_cmg = (1-LEAK_PERCENT) * output_cmg + (LEAK_PERCENT) * motion_cmg
         self.ar_initialized[:] = True
 
         return self.cmg2usd(output_cmg)
+
+    def _gated_offset(self, qref_pos, command):
+        """Blend CMG qref with default_joint_pos based on command magnitude.
+
+        At cmd≈0 the only positional reward (standing_still) targets default_joint_pos,
+        so the action offset must match. At walking speed the CMG imitation reward targets
+        qref, so the offset should be qref. Smooth ramp in [0, 0.1] on ||cmd||.
+        """
+        cmd_norm = torch.norm(command, dim=1, keepdim=True)          # [N, 1]
+        gate = torch.clamp(cmd_norm / 0.1, 0.0, 1.0)                # 0→standing, 1→walking
+        return gate * qref_pos + (1.0 - gate) * self.default_joint_pos
 
     def _cmg_reset_ar(self, done_mask):
         """Reset AR state for environments that terminated."""
@@ -160,16 +180,14 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                     # Residual action from policy
                     residual = self.alg.act(obs)  # [N, 29]
 
-                    # Final action = reference joint positions + residual
-                    actions = qref[..., :29] + residual
-                    actions[:, 25] = 0.0  # left wrist pitch
-                    actions[:, 26] = 0.0  # right wrist pitch
+                    # CMG reference as action offset (standing_still reward now targets CMG too)
+                    self.action_term._offset = qref[..., :29]
 
                     # Inject CMG output into env.extras for reward computation
                     self.env.unwrapped.extras["cmg_motion"] = qref
 
-                    # Step the environment
-                    obs_tensor, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+                    # Step with just the residual
+                    obs_tensor, rewards, dones, extras = self.env.step(residual.to(self.env.device))
                     if "observations" in extras:
                         obs = TensorDict(extras["observations"], batch_size=[self.env.num_envs])
                     else:
@@ -179,7 +197,6 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
                     # Reset AR state for done envs
                     self._cmg_reset_ar(dones.bool())
-
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg_cfg["rnd_cfg"] else None
                     self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
 
@@ -231,8 +248,8 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
 
         Returns a wrapper that:
         1. Runs AR CMG to get reference joint positions
-        2. Runs residual policy to get corrections
-        3. Returns final action = qref[:29] + residual
+        2. Sets CMG reference as action offset
+        3. Returns residual only (env applies: residual * scale + qref)
 
         The returned function accepts an optional `dones` kwarg to reset AR state.
         """
@@ -253,10 +270,11 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 if robot_data is not None:
                     joint_pos, joint_vel = robot_data
                 else:
-                    policy_obs = obs["policy"]
-                    current_frame = policy_obs[..., -self.single_frame_dim:]
-                    joint_pos = current_frame[..., self.joint_pos_idx]
-                    joint_vel = 20 * current_frame[..., self.joint_vel_idx]
+                    raise ValueError("WTF")
+                    # policy_obs = obs["policy"]
+                    # current_frame = policy_obs[..., -self.single_frame_dim:]
+                    # joint_pos = current_frame[..., self.joint_pos_idx]
+                    # joint_vel = 20 * current_frame[..., self.joint_vel_idx]
                 command = obs["cmg_input"]
 
                 n = joint_pos.shape[0]
@@ -288,16 +306,18 @@ class OnPolicyRunnerResidual(OnPolicyRunner):
                 output_cmg = cmg_out_norm * self.motion_std + self.motion_mean
                 output_cmg = torch.clamp(output_cmg, -3.14, 3.14)
 
-                ar_state["prev"] = output_cmg.clone()
+                # Leaky AR: post-blend stored state (matches deploy C++)
+                ar_state["prev"] = (1-LEAK_PERCENT) * output_cmg + (LEAK_PERCENT) * motion_cmg
                 ar_state["init"][:] = True
 
                 qref = self.cmg2usd(output_cmg)
                 obs["motion"] = qref
+
+                # CMG reference as action offset
+                self.action_term._offset = qref[..., :29]
+
                 residual = self.alg.policy.act_inference(obs)
-                actions = qref[..., :29] + residual
-                actions[:, 25] = 0.0
-                actions[:, 26] = 0.0
-                return actions
+                return residual
 
         return inference_policy
 
